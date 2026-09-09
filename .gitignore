@@ -1,0 +1,10 @@
+build/
+cmake-build*/
+*.o
+*.d
+*.elf
+*.bin
+*.hex
+*.map
+.vscode/
+.DS_Store
