@@ -79,9 +79,11 @@ above.
 
 Every host-side/software/config lever we could find — bus width, clock
 speed (80x range), clock edge, D0 pin, `HardwareFlowControl`, polling
-vs. IDMA, read address, and a full sweep of the SDMMC1 RX delay-block's
-sampling phase (1536 points) — either made no difference or produced a
-different, separately-understood failure. None fixed the read.
+vs. IDMA, read address, a full sweep of the SDMMC1 RX delay-block's
+sampling phase (1536 points), and ST support's own suggested
+1-bit-then-switch `BusWide` sequencing fix (ticket 00268848) — either
+made no difference or produced a different, separately-understood
+failure. None fixed the read.
 
 Two pieces of direct evidence stand out:
 

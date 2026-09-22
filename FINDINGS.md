@@ -24,6 +24,15 @@ yourself.
   hsd1.Init.HardwareFlowControl = SDMMC_HARDWARE_FLOW_CONTROL_ENABLE;
   hsd1.Init.ClockDiv       = 0;                   /* ~36MHz bypass */
   ```
+  **Updated after ST's reply (ticket 00268848):** `BusWide` is now set to
+  `SDMMC_BUS_WIDE_1B` at the first `HAL_SD_Init()` call, switching to
+  4-bit afterward via `BSP_SD_Init()`'s own `HAL_SD_ConfigWideBusOperation()`
+  call, per ST's suggested fix — see
+  [ST-suggested fix](#st-suggested-fix-1-bit-then-switch-buswide-sequencing-tested-no-effect)
+  below. Confirmed to produce an identical failure to the direct-4-bit
+  init shown above, so every *earlier* result in this document (before
+  that section) was captured with the direct-4-bit `BusWide` line as
+  written here.
 - SDMMC kernel clock: PLL2 @ M=8,N=144,P=2,Q=2,R=4,
   `SdmmcClockSelection = RCC_SDMMCCLKSOURCE_PLL2`, nominal 36 MHz
   feeding `SDMMC1` (see `HAL_SD_MspInit()` in
@@ -298,17 +307,63 @@ worsened by PB13's non-matched trace length relative to D1-D3), rather
 than two unrelated bugs. We haven't proven this connection, but it's the
 most concrete lead either investigation has produced.
 
+## ST-suggested fix: 1-bit-then-switch `BusWide` sequencing (tested, no effect)
+
+ST support (ticket 00268848) pointed to a known CubeMX+FatFs issue and a
+specific workaround: call `HAL_SD_Init()` with `hsd1.Init.BusWide` set to
+`SDMMC_BUS_WIDE_1B`, then switch to 4-bit afterward via a separate
+`HAL_SD_ConfigWideBusOperation(&hsd1, SDMMC_BUS_WIDE_4B)` call, rather
+than initializing directly in 4-bit mode.
+
+Worth noting: `BSP_SD_Init()` (`FATFS/Target/bsp_driver_sd.c`, unmodified
+CubeMX output) already contains exactly that two-step sequence — but it
+was never actually *exercised* as "1-bit then switch" in this repro,
+because `hsd1.Init.BusWide` was set to `SDMMC_BUS_WIDE_4B` before the
+*first* `HAL_SD_Init()` call, so every call downstream (including the one
+inside `BSP_SD_Init()`) was already attempting a direct 4-bit init. This
+was a genuinely new code path, not something previously tried.
+
+**Changed `MX_SDMMC1_SD_Init()`'s `hsd1.Init.BusWide` to
+`SDMMC_BUS_WIDE_1B`** so the first real `HAL_SD_Init()` call — the one
+inside `BSP_SD_Init()`, triggered by `f_mount()` — genuinely initializes
+in 1-bit mode first, then switches to 4-bit via `BSP_SD_Init()`'s own
+existing `HAL_SD_ConfigWideBusOperation()` call, exactly matching ST's
+recommended sequence.
+
+(While in there, also found and fixed a real bug unrelated to ST's
+suggestion: `hsd1.Init.HardwareFlowControl` had gone missing from
+`MX_SDMMC1_SD_Init()` at some point — silently defaulting to `DISABLE`
+`(0x0)` rather than the intended `ENABLE`. Harmless at the `ClockDiv=40`
+capture speed used for the Saleae work above, since flow control only
+matters once the receiver could plausibly fall behind, but re-added
+explicitly before testing ST's fix at full speed to avoid conflating two
+different variables.)
+
+**Result: no change.** `f_mount()` still returns `FR_DISK_ERR`, and the
+register-level read is byte-for-byte identical to every other
+configuration tried:
+```
+STA=0x00000002 DCOUNT=0 dataremaining=0 fifoReads=16
+(DCRCFAIL=1 RXOVERR=0 DTIMEOUT=0 DATAEND=0)
+```
+This directly rules out the specific CubeMX+FatFs sequencing issue ST
+described as the explanation here — that issue's fix changes nothing
+about our failure. Left the init order as ST recommended (1-bit then
+switch) anyway, since it's the more defensive/correct pattern regardless
+of whether it's the fix.
+
 ## Recommended next step
 
 Every host-side/software/config lever we could find has been tried
 (width, speed, edge, flow control, pin, data-movement mechanism, address,
-RX sampling phase), and now the actual bus signals have been captured and
-show real, physical bit-level corruption concentrated in part of the
-transfer. We believe the next productive step is on the electrical side:
-checking for simultaneous-switching noise/crosstalk between the four data
-lines during a real 4-bit transfer (e.g. an oscilloscope capture of the
-analog waveforms, not just digital logic levels, focused on the corrupted
-region of the transfer), and/or advice from ST on whether this board's
+RX sampling phase, and now ST's own suggested init-sequencing fix), and
+the actual bus signals have been captured and show real, physical
+bit-level corruption concentrated in part of the transfer. We believe the
+next productive step is on the electrical side: checking for
+simultaneous-switching noise/crosstalk between the four data lines during
+a real 4-bit transfer (e.g. an oscilloscope capture of the analog
+waveforms, not just digital logic levels, focused on the corrupted region
+of the transfer), and/or advice from ST on whether this board's
 trace-length mismatch on D0 (PB13 vs. the matched CN8 group) is expected
 to cause this class of failure in 4-bit mode specifically.
 

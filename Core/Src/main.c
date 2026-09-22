@@ -223,7 +223,18 @@ static void MX_SDMMC1_SD_Init(void)
   hsd1.Instance = SDMMC1;
   hsd1.Init.ClockEdge = SDMMC_CLOCK_EDGE_RISING;
   hsd1.Init.ClockPowerSave = SDMMC_CLOCK_POWER_SAVE_DISABLE;
-  hsd1.Init.BusWide = SDMMC_BUS_WIDE_4B;
+  hsd1.Init.HardwareFlowControl = SDMMC_HARDWARE_FLOW_CONTROL_ENABLE;
+  // ST support ticket 00268848 suggested a known CubeMX+FatFs issue where a
+  // project initialized directly in 4-bit mode fails, but works if
+  // HAL_SD_Init() is called with 1-bit first and then switched to 4-bit via
+  // a separate HAL_SD_ConfigWideBusOperation() call (BSP_SD_Init() in
+  // FATFS/Target/bsp_driver_sd.c, unmodified CubeMX output, already does
+  // exactly that second step - it just was never actually exercised as
+  // "1-bit then switch" because this handle was pre-set to 4-bit before
+  // ever calling HAL_SD_Init() the first time). Tested: no effect, byte-
+  // for-byte identical DCRCFAIL signature. Left set to 1B anyway since it's
+  // the more defensive init order regardless - see FINDINGS.md.
+  hsd1.Init.BusWide = SDMMC_BUS_WIDE_1B;
   hsd1.Init.ClockDiv = 0;
   if (HAL_SD_Init(&hsd1) != HAL_OK)
   {
