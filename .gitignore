@@ -8,3 +8,11 @@ cmake-build*/
 *.map
 .vscode/
 .DS_Store
+__pycache__/
+
+# Raw logic-analyzer captures from the H723ZG-on-F401-harness investigation -
+# 70MB/27MB, too large for git history. README.md and decode_capture.py in
+# that directory stay tracked; only the bulk CSV data is excluded. Kept
+# locally - if these specific captures need to be archived, do that out of
+# band (e.g. attach to ST ticket 00268848) rather than committing them.
+captures/f401-harness/*.csv

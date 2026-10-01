@@ -1,5 +1,34 @@
 # st-sd-ref — SDMMC1 4-bit SD/FAT access fails (NUCLEO-H7A3ZI-Q)
 
+## Major update (2026-09-29) — read this before the rest of this README
+
+Everything below this point describes the state of the investigation as
+filed with ST (ticket 00268848) and is kept for reproducibility, but **the
+conclusion has changed substantially since, and the "please advise, we're
+out of ideas" framing below is no longer accurate.** Two things changed it:
+
+1. **The most-cited evidence for a peripheral/silicon defect (a Saleae
+   capture allegedly showing single-bit corruption on the command line) was
+   retracted** — it was a logic-analyzer decode artifact (a sampling-timing
+   ambiguity at the capture's sample rate), not real corruption. Do not cite
+   it.
+2. **A designed experiment found the 4-bit data-line failure is a precisely
+   characterized simultaneous-switching effect, and moving the same card to
+   a real PCB with a built-in SD slot (not a bare-wire breakout adapter,
+   like this repro uses) reads 100% clean at every speed and content
+   pattern that failed 100% of the time here** — including the worst-case
+   stress pattern.
+
+**Current conclusion: this reads as a board-layout/decoupling-quality issue
+specific to bare-wire breakout adapters (exactly this repro's own hardware
+setup), not a defect in the SDMMC v2 peripheral, the H7 chip family, or the
+driver code below.** Full detail: `FINDINGS.md`'s "Round 5" and "Round 6"
+sections. If re-engaging ST, the honest ask is now "we characterized a
+board-layout-dependent signal-integrity effect on our own bare-wire test
+harness, and want to confirm whether it's expected behavior for this class
+of physical connection" — not "please find the peripheral/driver bug,"
+which is what everything below still asks.
+
 ## Problem
 
 Basic SD card / FAT access on a NUCLEO-H7A3ZI-Q — CubeMX-generated
@@ -80,10 +109,14 @@ above.
 Every host-side/software/config lever we could find — bus width, clock
 speed (80x range), clock edge, D0 pin, `HardwareFlowControl`, polling
 vs. IDMA, read address, a full sweep of the SDMMC1 RX delay-block's
-sampling phase (1536 points), and ST support's own suggested
-1-bit-then-switch `BusWide` sequencing fix (ticket 00268848) — either
+sampling phase (1536 points), and three separate attempts at ST's
+suggested init-sequencing fix (ticket 00268848), including the actual
+ST-confirmed known-issue fix found on the ST community forum — either
 made no difference or produced a different, separately-understood
-failure. None fixed the read.
+failure. None fixed the read. See FINDINGS.md for why we believe our
+failure is a different bug from the one ST's known-issue writeup
+describes, and for an independent report of the same failure shape from
+another ST community member on different H7 hardware.
 
 Two pieces of direct evidence stand out:
 
@@ -101,6 +134,13 @@ Two pieces of direct evidence stand out:
 
 Full detail, register dumps, and the reasoning behind each ruled-out
 cause: **[FINDINGS.md](FINDINGS.md)**.
+
+**Update since filing:** an independent RTOS (Zephyr) reproduces the
+identical failure on a second STM32H7 chip, and a bare-wire test harness
+proven clean in 4-bit mode on the older "SDIO" peripheral (STM32F401)
+fails 100% of the time at every speed tested when moved unmodified to a
+newer "SDMMC v2" chip (STM32H723). See FINDINGS.md's "Round 3" and
+"Round 4" for detail — this evidence hasn't been re-reported to ST yet.
 
 ## Diagnostics included
 

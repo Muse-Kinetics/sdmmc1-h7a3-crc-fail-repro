@@ -11,7 +11,7 @@ yourself.
   `STM32H7A3ZITxQ` / board `NUCLEO-H7A3ZI-Q`, CMake toolchain output.
   Based on the SDIO/SDMMC 4-bit tutorial at
   https://controllerstech.com/interface-sd-card-with-stm32-via-sdio-4bit-mode/
-  (an F446-targeted walkthrough; `Reference/st-sd/SDCARD_SDIO_F446` in
+  (an F446-targeted walkthrough; `Bringup/st-sd/SDCARD_SDIO_F446` in
   the parent repo is that original F446 reference project, included for
   comparison) — re-created for the H7A3/SDMMC1 peripheral.
 - Real-world/default `SDMMC1` init parameters (`Core/Src/main.c`,
@@ -352,20 +352,1036 @@ about our failure. Left the init order as ST recommended (1-bit then
 switch) anyway, since it's the more defensive/correct pattern regardless
 of whether it's the fix.
 
+### Verifying ST's fix, and a more specific community-forum fix, against real ST source
+
+Checked our implementation against real ST source rather than trusting
+our own reading of the support reply. **AN5200** (53 pages, read in full)
+does not contain this workaround at all; it does document a checkable
+`SDMMC_hclk` timing constraint (§5), confirmed not remotely violated
+here (180MHz vs. a required >13.5MHz). **ST's own current BSP SD driver**
+for a board with a real SD slot (`stm32h7b3i_eval_sd.c`,
+github.com/STMicroelectronics/stm32h7b3i-eval-bsp) confirms
+1-bit-then-switch is genuine ST practice, matching what we tested — one
+difference, `HardwareFlowControl=DISABLE` (vs. our `ENABLE`), tested in
+combination with correct sequencing: **fails differently**, a genuine
+mid-transfer stall (`STA=0x00081000 DCOUNT=448 fifoReads=2`, no error
+flag ever sets) rather than `DCRCFAIL` — resembles the parent repo's
+original BLOCKER-010 stall more than our usual signature. Reverted to
+`ENABLE`.
+
+Separately, found a more specific community thread than ticket 00268848's
+reply: **"Solution for STM32-F7 SDMMC in 4-Bit wide bus mode issue"**
+(community.st.com/t5/stm32cubemx-mcus-29/solution-for-stm32-f7-sdmmc-in-4-bit-wide-bus-mode-issue-125022),
+ST-confirmed as a known issue. Its actual root cause and fix are more
+specific than the ticket reply: `SD_WideBus_Enable()` reads the card's
+SCR register (a 1-bit-only transfer) before the peripheral's own width
+register is set to 4-bit, and on the affected F7 HAL, that peripheral is
+*already* sitting in 4-bit at the moment of the read — corrupting it. The
+fix is a third, raw `SDMMC_Init()` call (1-bit, identification speed)
+inserted between `HAL_SD_Init()` and the width-switch call. Tested
+faithfully (matching the OP's exact starting condition and fix code,
+adapted for H7's `SDMMC_InitTypeDef`): **no change**, identical `DCRCFAIL`
+signature. This makes sense in retrospect — our H7 HAL's
+`HAL_SD_InitCard()` **hardcodes** 1-bit for its own identification-phase
+peripheral init regardless of configured `BusWide`, so the SCR read on H7
+always happens against a genuinely-1-bit-configured peripheral by
+construction; the specific mechanism this fix addresses doesn't exist in
+our HAL version. Also: our failure happens strictly *after* a successful
+width switch (confirmed via Saleae — correctly-framed 4-bit signaling
+during real transfers), not during it like the F7 thread describes — a
+different bug from the one ST's KB describes, not an unresolved instance
+of the same one.
+
+One more independent data point found the same way: a separate,
+unresolved ST community thread — **"Again, trouble with SDMMC2 on
+STM32H755 in 4 bit mode -> CRC fail"**
+(community.st.com/t5/stm32-mcus-security/again-trouble-with-sdmmc2-on-stm32h755-in-4-bit-mode-gt-crc-fail/td-p/178646)
+— describes a different user, chip, and SDMMC instance hitting the same
+shape (1-bit works, 4-bit fails `DCRCFAIL`). Not proof of anything, but
+independent evidence this class of failure isn't unique to our
+board/wiring.
+
+## Community research: other 4-bit SDIO/SDMMC bug reports (all ruled out)
+
+Surveyed every other public report of "4-bit SDIO/SDMMC breaks, 1-bit
+works" we could find while waiting on ST. None explain our failure:
+
+- **STM32World's "SDIO 4-Bit Really Works!" video + repos** (STM32F405,
+  classic SDIO peripheral): uses the same 1-bit-then-switch fix we'd
+  already tested, but their unfixed symptom is a **hang** during init,
+  not our clean post-transfer-start `DCRCFAIL` — a different failure on
+  a different peripheral generation.
+- **dtiziano/stm32_uSD_SDIO4bit** (STM32F469): same fix, same origin (F.
+  Belaid's 2019 forum report ST's own ticket reply also cites). No new
+  information.
+- **bkht/Nucleo-H743ZI_SDMMC** — the most relevant: a genuine H7 (H743)
+  project setting `BusWide=4B` directly (no 1-bit-then-switch) and
+  reporting it working, independent same-family confirmation that
+  `HAL_SD_InitCard()` hardcodes 1-bit identification-phase regardless of
+  configured `BusWide`. Its three config differences from ours (D0 on
+  PC8, `ClockDiv=2`, `HardwareFlowControl=DISABLE`) were each already
+  covered by our own isolated testing, but we tested the exact literal
+  combination anyway (cloned his repo, ported his `MX_SDMMC1_SD_Init()`/
+  `BSP_SD_Init()` values verbatim, kept D0 on our own PB13 rather than
+  his PC8 since PC8 is only reachable here via an already-known-worse
+  flying jumper — see `corrections.md`). **Result: identical `DCRCFAIL`
+  signature.** His vendored HAL (v1.5.0, 2019) independently confirms the
+  same 1-bit-identification hardcoding six years and multiple HAL
+  generations apart — long-standing HAL behavior, not a regression.
+- **"STM32H743 unreliable micro SD transfers"** community thread —
+  closest-sounding by title but a different bug (multi-block `CMD18`/
+  `CMD25`/`CMD12`, `CCRCFAIL` not `DCRCFAIL`; we only ever exercise
+  single-block `CMD17`). One detail was directly testable though: several
+  users reported `GPIO_SPEED_FREQ_MEDIUM` (vs `VERY_HIGH`) helping
+  elsewhere. Tried it (all three `HAL_GPIO_Init()` calls in
+  `HAL_SD_MspInit()`). **Result: no change**, identical signature.
+
+## Cross-chip control test: NUCLEO-H723ZG (update - changes the picture)
+
+Full writeup: `Bringup/H723ZG/sd-repro/FINDINGS.md`. Short version: we
+ported this project's exact repro code to a NUCLEO-H723ZG (a different
+STM32H7 chip, on ST's own clean matched-trace MB1364 reference board
+layout - the D0/PB13 trace mismatch below doesn't exist on this board),
+then tested bkht/Nucleo-H743ZI_SDMMC's literal init values and
+`bsp_driver_sd.c` (not just the extracted values we'd tried before -
+diffed his full file to confirm no hidden logic differs). **Every
+variant failed with the identical `DCRCFAIL` signature** (`STA=0x00000002
+DCOUNT=0 fifoReads=16`) once configured to avoid an unrelated FIFO
+overrun (`HardwareFlowControl=DISABLE` - both CubeMX's default and
+bkht's own literal setting - overruns on this board too before ever
+reaching the data phase; `ENABLE` is required to get a real transfer
+attempt on either of our boards). Both SD cards used in this whole
+investigation are independently verified good on a Teensy 4.1 (unrelated
+silicon), ruling out a card defect.
+
+This is real evidence against the trace-mismatch theory below - a board
+without that mismatch fails identically - and reframes the likely
+explanation toward a genuine STM32Cube_FW_H7 HAL/LL_SDMMC driver bug
+(this HAL version, v1.11.6, confirmed identical between both projects)
+affecting 4-bit single-block `CMD17` reads across the H7 family
+generally, rather than anything specific to our board's hardware.
+
+**Is bkht's own "it works" claim solid?** Not fully — his demo never
+verifies a fresh write-then-read round trip (the only real read is of a
+small, pre-loaded, never-rewritten file; his own writes' read-backs are
+commented out). Not proof his hardware has our bug, but his repo
+"working" is compatible with this exact failure being present and never
+triggered.
+
+**A real HAL-version difference, tested and ruled out:** his vendored
+`HAL_SD_ReadBlocks()` (v1.5.0, 2019) sends CMD16 (`SET_BLOCKLEN`) before
+every read; ours (v1.11.6) dropped that somewhere along the way. Added it
+back into our diagnostic, matching his exact sequence — **no change**,
+identical signature. Real difference, not the cause.
+
+**Pushing back on "we're doing something wrong":** a bug hitting two
+different Nucleo boards identically is a priori more likely to mean user
+error than an undocumented driver bug, so this was checked directly
+(full detail: `Bringup/H723ZG/sd-repro/FINDINGS.md`, "Round 2"):
+vendored HAL confirmed byte-for-byte identical to the official GitHub
+tag; not a retry-fixable transient (three consecutive reads, no re-init,
+identical failure); ST's own errata sheets (ES0478, ES0491) are clean —
+no acknowledged silicon erratum matches; and a genuinely new variable,
+clock *source* (bkht's board uses HSE, ours HSI) — tested with every
+downstream frequency held numerically identical, **no change**. External
+research (embassy-rs and NuttX issues) confirms `DCRCFAIL`-class SDMMC
+fragility is a documented cross-chip phenomenon on this IP generation
+industry-wide, though neither's specific resolved bug transfers to
+explain our polling-mode failure directly.
+
+## Round 3: Zephyr RTOS - the strongest cross-stack evidence yet
+
+Full writeup: `Bringup/H723ZG/sd-repro/FINDINGS.md`, "Round 3." Short
+version: installed the full Zephyr RTOS toolchain (`west` + Zephyr SDK
+v1.0.1) and built its stock, unmodified `samples/subsys/fs/fs_sample`
+for `nucleo_h723zg` - a completely independent SD card driver stack
+(`drivers/disk/sdmmc_stm32.c` + `subsys/fs`), sharing nothing with our
+CubeMX repro except the silicon, the physical wiring, and the card.
+
+Found and fixed a real, separate Zephyr/board-config bug along the way:
+this board's stock devicetree feeds SDMMC1 from `PLL1_Q` at 137.5MHz,
+but the STM32 disk driver hard-requires exactly 48MHz
+(`CONFIG_SDMMC_STM32_CLOCK_CHECK`) and fails before ever touching the
+card if that's not met. Fixed by routing SDMMC1 to a `PLL2_R` configured
+for exactly 48MHz instead (the same clock source `stm32h747i_disco`'s
+own working reference config uses) - unrelated to BLOCKER-011, but worth
+knowing about if anyone else tries Zephyr on this board.
+
+**With that real bug out of the way, card init succeeds and Zephyr
+reaches a genuine, stock `f_mount()` -> `HAL_SD_ReadBlocks_IT()` call
+(interrupt-driven, not our polling mode) - and it fails.**
+`priv->hsd.ErrorCode = 0x6` = `SDMMC_ERROR_DATA_CRC_FAIL` (0x2) |
+`SDMMC_ERROR_CMD_RSP_TIMEOUT` (0x4). Confirmed with GDB, traced
+instruction-by-instruction from `stm32_sdmmc_access_init()` through to
+the read failure - not inferred from log output.
+
+This is the strongest cross-stack data point gathered in this whole
+investigation. Every other variable that's differed between our repro
+and something else (chip, board, HAL version, clock source, driver
+implementation, transfer mode) has now been varied independently at
+some point, and this result varies *all of them simultaneously* in one
+shot: different chip (H723, not H7A3), different driver code entirely
+(not ST's `bsp_driver_sd.c`/`sd_diag.c`, not even the same HAL call -
+`HAL_SD_ReadBlocks_IT` vs. our `HAL_SD_ReadBlocks`/`SD_ReadBlocks_Diag`),
+a different, independently-validated clock source, and Zephyr's own
+GPIO/pinctrl bring-up - and `DCRCFAIL` still appears.
+
+## Round 4: known-good bare-wire harness, moved across peripheral generations
+
+Motivation (Eric, 2026-09-25): every repro so far has run on a Nucleo +
+breakout-adapter setup. Before trusting any more conclusions about "the
+peripheral" vs. "our wiring," build one controlled physical artifact and
+move *it* — not a redesigned one — across chips. Plan: solder a bare
+microSD-to-SD adapter with jumper leads exactly like stm32world.com's
+documented STM32F405 SDIO 4-bit example (no external pull-ups, rely on
+internal MCU pull-ups), prove it works on a classic SDIO (v1) chip, then
+move the identical physical harness to an SDMMC-v2/IDMA chip.
+
+### F401 baseline: fresh project, two real firmware bugs found and fixed
+
+New from-scratch CMake project, `Bringup/F401-known-good/sdio-test/`
+(NUCLEO-F401RE, STM32F401RE, classic "SDIO" peripheral — external DMA
+generation, not IDMA). D0-D3=PC8-11, CK=PC12, CMD=PD2 (Morpho CN7/CN10),
+`GPIO_PULLUP` on D0-D3/CMD, `GPIO_NOPULL` on CLK (matching the bare
+adapter, no external pull-ups), classic 1-bit-then-switch init pattern
+(confirmed via reading F4's actual HAL source that this is F4's
+*mandatory* API usage, not an optional workaround — unlike H7,
+`HAL_SD_Init()` on F4 does not auto-call
+`HAL_SD_ConfigWideBusOperation()`).
+
+Two real, unrelated firmware bugs surfaced during bring-up (found via
+GDB, `monitor reset halt` + breakpoints on `main`/`Error_Handler`/
+`_write`, since a failure before UART init produces silent zero output):
+
+1. **`HAL_RCC_OscConfig()` failed with both `RCC_HSE_BYPASS` (ST-LINK MCO
+   relay) and `RCC_HSE_ON` (onboard crystal)** — this specific board has
+   no usable HSE at all. Fixed by sourcing the PLL from HSI (internal
+   16MHz RC oscillator) instead — same PLL output frequencies (84MHz
+   SYSCLK, 48MHz SDIOCLK), just HSI-sourced, sidestepping the board's
+   external-clock ambiguity entirely.
+2. The onboard ST-LINK/V2-1's firmware (`V2J25M13`) was too old for
+   STM32CubeProgrammer to connect to at all (hard refusal, not a
+   warning). Fixed with a one-time ST-LINK firmware upgrade (ST's
+   `STLinkUpgrade.jar`, run directly against the Adoptium JRE already
+   bundled with the STM32Cube tools since the app's own bundled launcher
+   couldn't find a system JRE).
+
+**Clock-divider sweep** (`SD_Diag_ClockDivSweep()`, 5 reads per point,
+4-bit, LBA 8192): `SDIO_CK = 48MHz / (ClockDiv + 2)`.
+
+| ClockDiv | Speed | Result |
+|---|---|---|
+| 118 | 400kHz | 5/5 clean |
+| 46 | 1MHz | 5/5 clean |
+| 22 | 2MHz | 5/5 clean |
+| 10 | 4MHz | 5/5 clean |
+| 6 | 6MHz | 5/5 clean |
+| 4 | 8MHz | 5/5 clean |
+| 2 | 12MHz | 5/5 clean |
+| **1** | **16MHz** | **0/5 — hard `DCRCFAIL`** |
+| 0 | 24MHz | 0/5 — hard `DCRCFAIL` |
+
+A sharp cliff, not gradual degradation — every point ≤12MHz is 5/5
+clean, every point ≥16MHz is 0/5. At `ClockDiv=0` (the ~24MHz config this
+whole investigation's H7 side uses by default), the first sweep run
+before finding this ceiling read a *genuine, partial* FAT32 boot sector —
+bytes 0–415 exactly correct (including the `"...Non-system disk...
+Press any key..."` string), bytes 416–511 untouched poison — i.e. real
+card data started flowing correctly and then CRC-failed mid-block. This
+harness-construction technique is real and sound; it just tops out well
+below the ~24-25MHz "default speed" spec limit on jumper wire with no
+ground plane.
+
+### Moved to NUCLEO-H723ZG — zero rewiring, complete failure at every speed
+
+The H723ZG uses the *identical* pin group (`Bringup/H723ZG/sd-repro`'s
+own `HAL_SD_MspInit()`: PC8-11/PC12/PD2, `GPIO_PULLUP` on D0-D3/CMD,
+`GPIO_NOPULL` on CLK) — the F401 harness plugs in with **no rewiring at
+all**. Ported the same `SD_Diag_ClockDivSweep()` (H7 formula: `SDMMC_CK =
+SDMMCCLK / (2*CLKDIV)`, SDMMCCLK=48MHz via PLL1Q) into
+`Bringup/H723ZG/sd-repro/Core/Src/sd_diag.c`, reusing the existing
+`SD_ReadBlocks_Diag_Quiet()` helper already there for the DLYB sweep.
+
+(One more firmware-quality bug found and fixed along the way: newlib-nano
+`stdout` is fully buffered by default when not attached to a tty, so a
+long-running sweep's `printf()` output doesn't physically transmit until
+a buffer-full flush — invisible to a live serial monitor with a short
+capture window, or silently lost if the board resets before that flush.
+Fixed with `setvbuf(stdout, NULL, _IONBF, 0)` right after the VCP comes
+up, so output streams in real time.)
+
+**4-bit result — every single point failed, including the SD spec's own
+400kHz identification speed:**
+
+| CLKDIV | Speed | Result |
+|---|---|---|
+| 60 | 400kHz | 0/5 — `STA=0x00000002` (`DCRCFAIL`) |
+| 24 | 1MHz | 0/5 — `DCRCFAIL` |
+| 12 | 2MHz | 0/5 — `DCRCFAIL` |
+| 6 | 4MHz | 0/5 — `DCRCFAIL` |
+| 4 | 6MHz | 0/5 — `DCRCFAIL` |
+| 3 | 8MHz | 0/5 — `DCRCFAIL` |
+| 2 | 12MHz (this project's prior default) | 0/5 — `DCRCFAIL` |
+| 1 | 24MHz (F401 sweep's max) | 0/5 — `DCRCFAIL` |
+| 0 | 48MHz (no-divide) | 0/5 — `STA=0x00000000` (no flags at all — separate anomaly, not investigated further) |
+
+Note `HAL_SD_Init()` (command/identification: CMD0/CMD8/ACMD41/CMD2/CMD3,
+run at this project's stock `ClockDiv=2`/12MHz) already succeeded before
+the sweep even started — the firmware didn't hang in `Error_Handler()`.
+So identification is fine at 12MHz; it's specifically the 4-bit *data*
+read that fails, at every tested speed, including well below where
+identification itself already proved the wiring sound.
+
+**1-bit verification pass (same harness, same board, only `hsd1.Init.BusWide`
+changed to `SDMMC_BUS_WIDE_1B`) — completely clean at every speed:**
+
+| CLKDIV | Speed | Result |
+|---|---|---|
+| 60 | 400kHz | 5/5 clean, `STA=0x00000100` (`DATAEND` only) |
+| 24 | 1MHz | 5/5 clean |
+| 12 | 2MHz | 5/5 clean |
+| 6 | 4MHz | 5/5 clean |
+| 4 | 6MHz | 5/5 clean |
+| 3 | 8MHz | 5/5 clean |
+| 2 | 12MHz | 5/5 clean |
+| 1 | 24MHz | 5/5 clean |
+| 0 | 48MHz (no-divide) | 5/5 clean — including the case that gave the all-zero anomaly in 4-bit |
+
+### Why this is the cleanest isolation in the whole investigation
+
+Same physical wires, same solder joints, same card, same pins, same
+GPIO pull config — the *only* variables that changed across this whole
+round were (a) which chip/peripheral generation, and (b) 1-bit vs 4-bit.
+Results:
+
+- **F401 (SDIO v1), 4-bit:** clean ≤12MHz, hard failure ≥16MHz — a
+  signal-integrity-shaped result (cliff at a specific speed).
+- **H723ZG (SDMMC v2/IDMA), 4-bit:** hard failure at *every* speed,
+  400kHz–48MHz — not a signal-integrity shape at all. Edge rate is set by
+  GPIO slew rate, not `SDMMC_CK`, so a crosstalk/simultaneous-switching
+  problem doesn't get gentler at low speed — but it should still surface
+  as *intermittent* failures at 400kHz (fewer transitions per unit time =
+  fewer chances for a marginal bump to land on a sample edge), not the
+  deterministic 0/5-at-every-point result actually seen. That determinism
+  is also consistent with a simpler explanation not yet ruled out here —
+  see the caveat immediately below.
+- **H723ZG (SDMMC v2/IDMA), 1-bit:** clean at *every* speed, including
+  full 48MHz no-divide — proving the CMD/CLK/D0 wiring, the card, and
+  this peripheral's single-lane receive path are all completely sound at
+  any speed this silicon can generate.
+
+The failure is isolated to the 4-bit data path (D1-D3 / wide-bus
+operation) on the SDMMC-v2/IDMA peripheral, independent of clock speed.
+This lines up with the community threads found earlier (both specifically
+on NUCLEO-H723ZG: identical `DCRCFAIL` shape, 1-bit always fine) and, in
+shape, with the original H7A3
+[Saleae capture](#saleae-capture-corruption-is-on-the-wire) — which also
+found real physical corruption at a *slow* capture speed (~450kHz), not
+just at full speed.
+
+**Important caveat, not yet closed:** the 1-bit pass proves CMD/CLK/D0
+are sound after the harness move — it does not and cannot say anything
+about D1-D3, since 1-bit mode never asserts them. The move itself was
+more disruptive than "zero rewiring" makes it sound: on the F401 these
+six lines split across two different Morpho headers (CN7/CN10); on the
+H723ZG they're all on one connector (CN8). Every pin came out of one
+socket and into a different one, in a different physical layout — a
+plausible place for D2/D3 to end up transposed or one line to seat badly.
+A swapped or open D1-D3 line is *itself* a clean, frequency-independent,
+4-bit-only explanation that fits every observation above just as well as
+a peripheral/silicon problem does, and hasn't been ruled out yet. Two
+cheap checks close this before treating the result as final: (1) move the
+harness back to the F401 and re-run its 4-bit sweep (firmware is already
+flash-ready) — if it's still 5/5 clean up to 12MHz, D1-D3 survived the
+round-trip; (2) a Saleae look at D1-D3 specifically checking they toggle
+at all, and in the right order, during a 4-bit attempt on the H723ZG.
+
+### Caveat closed: Saleae capture confirms D0-D3 pin mapping, and finds two new things
+
+Captured CMD/CLK/D0-D3 (Saleae Logic2, digital-only) on the H723ZG with
+the F401 harness still attached, single fixed-clock (`ClockDiv=60`,
+400kHz) `CMD17` read of LBA 8192. Capture, decode tooling (updated with
+this card's own ground-truth bytes, pulled from the F401's own clean
+400kHz read), and full writeup:
+[`captures/f401-harness/`](captures/f401-harness/).
+
+One real firmware bug found and fixed getting a clean capture:
+`SDMMC_PowerState_OFF()` (clearing `POWER.PWRCTRL`) does **not** actually
+gate the physical `SDMMC_CK` pin on this silicon — a live capture showed
+the clock still toggling at 400kHz for the full length of an ~8-second
+capture well after that call ran (confirmed via GDB it *was* reached and
+executed). `PWRCTRL` is evidently a logical/sequencing state, not a
+literal clock-output gate, on this SDMMC v2 implementation — despite RM
+language ("00: clock to the card is stopped") that reads as if it should
+be. Disabling the peripheral's own RCC clock domain
+(`__HAL_RCC_SDMMC1_CLK_DISABLE()`) does actually stop it, since that
+gates the clock generator driving the AF-muxed CK pin directly, not just
+the controller's internal state machine.
+
+**1. Pin mapping confirmed correct — the caveat above is closed.** The
+per-lane sanity check (`check_lane_swap()`, tries all 24 permutations of
+D0-D3 against the known-good content) found the canonical order
+(D3,D2,D1,D0 — standard SD 4-bit nibble order) matching clearly best
+(897/1024 nibbles), with every other permutation trailing well behind
+(next best 845/1024). No swap, no open line, no mis-seated pin — D1-D3
+made the move to the H723ZG's differently-laid-out connector intact. The
+Round 4 result stands: it's telling us something about the peripheral,
+not about our own re-seating of six wires.
+
+**2. New finding: real, CRC7-validated single-bit corruption on the CMD
+line itself, on the `READ_SINGLE_BLOCK` command.** Scanning the raw CMD
+bitstream right after the read's `SET_BLOCKLEN` (`CMD16`) response found
+a 48-bit frame decoding to command index 49 (`0b110001`), argument
+`0x00002000` (exactly LBA 8192 — our real target address) and a received
+CRC7 of `0x58`. Command index 49 isn't a real command in this sequence,
+but the argument is dead-on. Computing what CRC7 a *correct* `CMD17`
+frame (index 17 = `0b010001`, same argument) would carry gives
+**exactly `0x58`** — an exact match. That means every one of the 40
+CRC-protected bits is correct *except a single flipped bit in the command
+index's MSB*, and the card actually received (or at least responded to)
+something coherent, since the subsequent data phase runs to completion
+with the expected `fifoReads=16`/`DCRCFAIL` shape. This is the first
+direct evidence in this whole investigation of corruption on the CMD
+line, not just the data lines — previously only D0-D3 corruption had
+been observed (Saleae, H7A3) or inferred (DCRCFAIL, everywhere else).
+
+**3. The data-block corruption shape replicates the original H7A3
+capture, on a second, independent chip/harness/card.** Reconstructing
+the 512-byte block: **897/1024 nibbles match ground truth**, with
+corruption concentrated in bytes 0-111 (the front ~22%) and bytes
+112-511 (400 bytes, including the closing `55 AA` boot signature)
+matching exactly. This is the same shape as the original H7A3 capture
+([above](#saleae-capture-corruption-is-on-the-wire): front quarter
+corrupted, back three-quarters clean) — now confirmed on a *different*
+chip (H723ZG, not H7A3), a *different* physical harness (soldered
+bare-wire F401 adapter, not the H7A3's board), and a *different* SD card.
+Nibble-level diffing across the corrupted region shows the same
+"nibble-drop-then-resync" signature already documented for the parent
+repo's separate bit-bang 4-bit driver bug — not random noise, but a
+structured, localized dropout that self-corrects after roughly 100+
+bytes. Two independent chips, two independent physical setups, the same
+specific corruption shape: this is hard to explain as harness-specific
+bad luck and easy to explain as a shared characteristic of this chip
+family's 4-bit SDMMC v2 datapath.
+
+**Objection raised and addressed (2026-09-25, Eric):** "it's the same
+wire harness as the F401, why would this be electrical, especially at
+such a low clock speed?" Fair hit against a simple wire-crosstalk story
+— classical signal-integrity effects (reflections, coupling, ringing)
+scale with edge rate and trace geometry, not with how often transitions
+happen, and 400kHz gives a 2.5µs bit period, an eternity for a few-inch
+wire. If the *wire* were marginal, it should be marginal on both chips
+at the same low speed, not clean on one and broken on the other.
+
+The detail that resolves this: the corrupted `CMD17` frame is entirely
+**host-driven**. During a command, the MCU itself drives CMD (start bit,
+index, argument, CRC7, all of it) — the card only drives CMD during its
+response. So the CMD-line corruption isn't "a signal got corrupted in
+transit and the MCU misread it" - it's the MCU's own SDMMC1 peripheral
+putting a wrong bit onto a line *it is actively driving*. A low-impedance
+push-pull output is hard to disturb via external coupling from a
+neighboring line, especially at 400kHz. That points at something
+*inside* the SDMMC1 peripheral's own command-generation hardware
+glitching its own output right as it arms for a 4-bit data phase - a
+command/data state-machine sequencing hazard, not an external wire
+problem - which also better explains the shape seen throughout this
+round: corruption concentrated right at the command→data transition,
+clean once things settle. Also consistent with `GPIO_SPEED_FREQ_MEDIUM`
+(slower slew rate) making zero difference on the H7A3 earlier — if this
+were really edge-rate-driven external crosstalk, softening the edges
+should have helped.
+
+Net: "electrical" was too loose a word for the CMD-line finding
+specifically. The more precise candidate is a peripheral-internal
+command/data-phase transition hazard, which is software/register-visible
+in principle (worth the `HAL_SD_ConfigWideBusOperation()`/CPSM-DPSM
+register-sequence diff mentioned above) even though it isn't a
+driver-config *mistake* in the usual sense - it may be a real hardware
+sequencing bug baked into the SDMMC-v2 block that no register setting
+can route around. The data-line corruption is separate: D0-D3 during a
+read are *card*-driven, weakly pulled, and more plausibly touched by
+crosstalk from a neighboring line's transition - so a mixed
+explanation (host-side hazard on CMD, receive-side/crosstalk on data)
+remains on the table too.
+
+**Repeat capture (2026-09-25), remote — driven via the Saleae
+Automation API/MCP server rather than manual GUI capture, board reset
+via ST-Link with no one at the bench.** Confirms this is not a one-off:
+the data-block corruption reproduced **byte-for-byte identical** to the
+first capture (897/1024 nibbles, same corrupted range bytes 0-111, same
+reconstructed content down to the byte). Pin mapping reconfirmed correct
+(canonical order wins by the same margin, 897 vs. next-best 845). The
+CMD-line corruption was present again but with a *different, messier*
+pattern this time — several corrupted-looking command candidates, none
+cleanly CRC7-validating the way the first capture's single flipped bit
+did. That asymmetry is itself informative: **the data-phase corruption
+is deterministic across resets; the CMD-line corruption is not.** A
+single shared root cause could still produce both (e.g. a timing hazard
+whose CMD-line side effect is more marginal/timing-sensitive than its
+data-line side effect), but it's also consistent with two related-but-
+distinct mechanisms. See `captures/f401-harness/h723zg_lba8192_clockdiv60_repeat2.csv`.
+
+## Round 5: content dose-response — the mechanism is real, precisely characterized, and content-dependent, not a peripheral-wide fault
+
+An independent second-opinion pass (fresh model, given a condensed
+briefing rather than this full document, specifically to avoid anchoring
+on our own theories) re-analyzed the existing captures from scratch and
+overturned two things this document previously stated as fact:
+
+- **The data corruption is not "front of block corrupted."** It is
+  exactly N single-nibble *drops* (no substitutions, no insertions), each
+  one precisely at a nibble where all four data lines (or, on the H7A3's
+  split-pin layout, all three of its physically clustered D1-D3 lines)
+  rise simultaneously — a `0`→`F` (or `0`→`E` on H7A3) nibble transition.
+  The "clean tail from byte 112" in the Round 4 capture is just where the
+  last such transition in that particular sector's content happens to
+  fall, not a real front/back structure. Verified directly: the card's
+  own transmitted CRC16 equals CRC16 of the correct ground truth — the
+  card had the right data and the right checksum, it simply advanced its
+  bit counter a few extra times, which requires extra perceived clock
+  edges, which the digital SDMMC datapath cannot produce on its own.
+- **The single-bit `CMD17` corruption reported in Round 4 was a decode
+  artifact, not real corruption.** SDMMC v2 launches CMD/data a few ns
+  after the CLK edge; at the capture's sample rate that lands in the same
+  row as the CLK edge in an on-change CSV, and the shipped decoder
+  samples CMD at that row. Sampling one row earlier, the same captures
+  decode 24-25 clean CRC7-valid command frames including a correct
+  `CMD17`. This removes the strongest piece of evidence for a
+  peripheral-internal command-sequencing hazard (the "Driver vs. silicon"
+  discussion below is updated accordingly).
+
+Two real gaps in our own tooling surfaced during this review, both
+confirmed directly (not taken on faith): `captures/f401-harness/decode_capture.py`,
+run as committed, does not find `CMD17` in either Round 4 capture (the
+frame's own corrupted bits mean it doesn't match index 17/18) and so
+never reaches the byte-level analysis at all — the "897/1024, bytes
+0-111" numbers reported in Round 4 came from uncommitted ad-hoc analysis
+scripts, not the shipped tool. Separately, the original
+`captures/read_lba8192_clockdiv40.csv` capture's actual CLK frequency
+during the data phase measures ~100-160kHz directly from its timestamps,
+not the documented ~450kHz (`ClockDiv=40` assumption) — doesn't change
+the corruption finding, but the capture's own metadata was wrong.
+
+### Content dose-response experiment: designed, predicted, confirmed
+
+To test the mechanism directly rather than pattern-match on found data,
+wrote nine 512-byte test patterns to consecutive scratch LBAs (1-bit,
+already-reliable) and read each back in 4-bit, 5 reps, at 400kHz
+(`SD_Diag_PatternTest()`, `Bringup/H723ZG/sd-repro`):
+
+| Pattern | D-line transitions | Result |
+|---|---|---|
+| `00/00` repeating | none | 5/5 clean |
+| `FF/FF` repeating | none *within* the payload | **0/5 — `DCRCFAIL`** |
+| `00/01` (D0 only) | 1-line | 5/5 clean |
+| `00/07` (D0,D1,D2) | 3-line | 5/5 clean |
+| `00/0B` (D0,D1,D3) | 3-line | 5/5 clean |
+| `00/0D` (D0,D2,D3) | 3-line | 5/5 clean |
+| `00/0E` (D1,D2,D3) | 3-line | 5/5 clean |
+| `00/0F` (all 4, sparse, 256×) | 4-line | **0/5 — `DCRCFAIL`, 317/512 bytes mismatched** |
+| `0F/0F` (all 4, every nibble) | 4-line, max density | **0/5 — `DCRCFAIL`, 511/512 bytes mismatched** |
+
+**Every pattern without a 4-line simultaneous transition is 100% clean;
+every pattern with one is 100% failing.** The `FF/FF` result is the
+single most convincing data point: every SD data block begins with a
+mandatory all-zero start-bit token before the payload, so `FF/FF`'s
+payload (starting on `F`) has exactly one unavoidable `0`→`F` transition
+built into the protocol itself, regardless of content — and it fails
+100% of the time. Because the pattern is content-uniform, a dropped
+nibble is invisible to a byte-level diff (shifting an all-`F` stream by
+one nibble still reads as all-`F`) — the mismatch count reads `0/512`
+even while `STA` shows `DCRCFAIL` — yet the silicon's own CRC16 still
+catches it. That is about as clean a proof as this investigation has
+produced that a real nibble is disappearing, independent of any theory
+about why.
+
+This also sharpens the threshold precisely: on the H723ZG (D0-D3 all in
+one physical pin group, PC8-11), only all-4-line transitions fail — even
+`00/0E` (3 of 4 lines) is clean, unlike on the H7A3 (where D0 sits on a
+separate connector, PB13, from D1-D3, and `0→E` uses all 3 of *that*
+physically clustered subset). Same rule — every line within the
+physically-clustered group must switch together — different cluster
+size on each board, both self-consistent.
+
+**Net effect: this is now a well-characterized, content-dependent,
+simultaneous-switching effect, not a general "4-bit is broken" fault.**
+It reproduces on command, exactly where predicted and nowhere else. The
+"Driver vs. silicon" branches below should be read with this update: the
+CMD-line finding that most directly suggested a driver/peripheral-side
+sequencing hazard turned out to be a decode artifact, and the data-line
+mechanism now looks like a genuine physical-channel effect (consistent
+with card-side crosstalk/ground-bounce from N-line simultaneous
+switching), not a receive-datapath logic defect.
+
+**Still open, not yet resolved by this experiment:** why the identical
+physical harness/card tolerates this on the F401's SDIO(v1) peripheral
+up to 12MHz but fails on the H723ZG's SDMMC v2 at every speed including
+400kHz. The F401 is not immune in principle — it fails too, above
+12MHz — so the real question is why its margin against the same kind of
+event is so much larger, not why the mechanism is absent there. Not yet
+distinguished: CLK signal-quality/duty-cycle differences between the two
+peripherals' pin drivers at matched nominal frequency, versus
+host-board-specific ground/power return characteristics unrelated to
+peripheral generation as such. Planned: repeat the content dose-response
+test on the F401 above its 16MHz wall (does its failure also cluster on
+4-line transitions specifically, i.e. same mechanism with more margin, or
+is it a genuinely different, uniform signal-integrity failure?); and a
+physical A/B (decoupling at the card, series resistor on CLK, dedicated
+ground return, slower CLK slew) using the `0F/0F` pattern's mismatch
+count as a quantitative margin metric.
+
+## Round 6: a real PCB with a built-in SD slot is completely clean, at every stress level tested
+
+Moved the same SD card to a new STM32H72x/H73x-family dev board (generic
+Amazon PCB, built-in microSD slot — not a Nucleo + bare-wire breakout
+adapter), ST-Link V2 connected via SWD, assumed identical SDMMC1 pinout
+(PC8-11/PC12/PD2) to every other test in this investigation since that's
+this chip family's standard default. Reflashed the same
+`SD_Diag_PatternTest()` firmware unmodified.
+
+This board's console/UART wiring was unconfirmed (no onboard ST-Link/VCP
+verified), so results were read directly out of firmware memory via GDB
+(`gPatternResults[]`, populated in parallel with the existing `printf`
+output — see `sd_diag.c`) rather than relying on a serial capture, to
+keep the result independent of an unrelated wiring question. This is
+worth keeping as the default technique for any future untrusted/new
+board — a plain memory read after a known completion flag is set can't
+be broken by a wrong UART pinout guess.
+
+**Result: all 9 patterns, 5/5 clean, `STA=0x00000100` (`DATAEND` only),
+zero mismatched bytes — including `0F/0F` (all-4-line transitions, every
+nibble), the pattern that failed 100% of the time, every time, on the
+Nucleo + bare-adapter setup.** Same silicon (SDMMC v2), same firmware,
+same card, same worst-case content — the only variable that changed is
+the physical board.
+
+This is a strong, direct data point on the open cross-host-margin
+question from Round 5: a real PCB (presumably proper decoupling, ground
+plane, and controlled trace routing near the card connector) shows none
+of the simultaneous-switching effect at all, even under the most
+aggressive stress pattern this investigation has generated. Combined
+with Round 4/5 (the same peripheral generation fails 100% of the time on
+a bare-wire Nucleo adapter, at every speed, on specific content), this
+now reads much more like a **board-layout/decoupling-quality issue
+specific to bare-wire breakout adapters**, not a defect in the SDMMC v2
+peripheral or chip family generally. Still not yet isolated *which*
+specific layout factor matters (decoupling at the card vs. ground return
+quality vs. trace proximity) — the physical A/B test from Round 5 remains
+the way to find out on the adapter setup specifically, and this board
+becoming a permanent, real-PCB positive control makes future comparisons
+(e.g. testing whether a from-scratch bare-wire adapter can be built well
+enough to match this board's cleanliness) straightforward.
+
+**Follow-up, same session: swept the full speed range on this board too
+(`SD_Diag_PatternSweepTest()`), not just 400kHz.** Same 9 patterns at
+four speeds spanning this investigation's whole tested range — 400kHz,
+12MHz (the F401/SDIO harness's own failure threshold), 24MHz, and full
+48MHz no-divide (this peripheral's maximum). **All 36 combinations: 5/5
+clean, `STA=0x00000100` (`DATAEND` only), zero mismatched bytes** —
+including `0F/0F` (max-density all-4-line transitions) at full 48MHz,
+the single most aggressive test this investigation has run. This board
+shows literally zero instances of the effect anywhere in the parameter
+space where the Nucleo+bare-adapter setup showed it 100% of the time.
+
+(One side note from this session: attempted to identify which UART this
+undocumented generic board's labeled serial header is actually wired to,
+by enabling all nine UART/USART/LPUART instances on the chip on their
+default pins and transmitting each one's name - `Bringup/H723ZG/sd-repro/Core/Src/uart_id.c`,
+not wired into `main()` by default. Inconclusive: an adapter plugged
+into that header shows the same unrelated, non-`[SD-DIAG]`-formatted
+text regardless of which instance drives it, meaning whatever that port
+carries isn't coming from this chip's UART pins at all. Not pursued
+further - GDB memory readout, as used for every result on this board,
+is fully reliable regardless.)
+
+### Filesystem-level verification, MBR repair, and a read-latency benchmark (2026-09-28)
+
+Beyond raw block reads, confirmed this board can mount the card's real
+FAT32 filesystem and read an actual file through FatFs - `f_mount()` +
+`f_opendir()` + `f_open()`/`f_read()`, not just register-level block
+access - with results landing in `gFsRead` (`SD_Diag_ReadFirstFile()`),
+read via GDB, no serial dependency (consistent with everything else on
+this board).
+
+First attempt failed with `FR_NO_FILESYSTEM`: `BSP_PlatformIsDetected()`
+was reading a card-detect GPIO pin specific to the Nucleo's own socket
+(false "not present" on this different board - fixed by hardcoding
+`SD_PRESENT`, `FATFS/Target/fatfs_platform.c`), and after that fix,
+`f_mount()` still failed because **LBA 0 held a clean, error-free
+incrementing byte counter, not a valid MBR/boot sector** - while LBA
+8192 (this investigation's known-good address) held the real, familiar
+FAT32 boot sector byte-for-byte, read perfectly cleanly. Confirmed via
+direct raw reads (`gLba0Dump`/`gLba8192Dump`), independent of FatFs, so
+this was a filesystem-metadata gap, not a new instance of the SDMMC bug
+- the card and its real data were fully intact and correctly readable
+throughout. Not caused by any write path in this repo's firmware (grepped
+every `HAL_SD_WriteBlocks` call site - none ever target LBA 0), so it
+predates this investigation.
+
+Worked around initially with a fixed `+8192` sector offset in
+`FATFS/Target/sd_diskio.c`'s `SD_read()`/`SD_write()`, making FatFs treat
+the volume as a superfloppy starting where the real data actually lives
+- no card writes needed for that step. Result: full `f_mount()` +
+`f_opendir()` (`filesSeen=5`) + `f_open()`/`f_read()` success,
+`fileContent="test"` matching the actual root-directory text file.
+
+With the user's explicit authorization to write to this card as needed,
+replaced the offset workaround with a real fix: `SD_Diag_WriteMbr()`
+wrote a standard MBR at LBA 0 with one partition entry (type `0x0C`
+FAT32-LBA, start LBA 8192, size taken directly from the FAT32 boot
+sector's own recorded `TotalSectors32`/`HiddenSectors` fields, so it
+exactly matches what the filesystem already believes about itself) -
+verified by reading LBA 0 back and comparing byte-for-byte
+(`readBackMatches=1`, `STA=0x100` clean). Removed the diskio offset
+workaround entirely and re-ran the filesystem test: **`f_mount()` now
+succeeds via FatFs's normal, unmodified MBR-based volume discovery**
+(`mountResult=0`, same full directory/file read result as before) - the
+card is now genuinely, standardly partitioned, not dependent on an
+offset hack specific to this firmware.
+
+Also ran a read-latency benchmark (`SD_Diag_LatencyTest()`, project
+specification's bring-up milestone 9 / "SD Card Qualification"): 20
+repeated 32KB reads at each of four LBAs spread across the card (8192,
++5M, +20M, +50M), 4-bit/CLKDIV=0 (full speed, the same config Round 6
+proved clean at every content pattern), timed via the DWT cycle counter.
+**Result: ~4.89-5.17 ms per 32KB read, essentially no variance (±1-2 µs
+across 20 reps) and no meaningful difference between regions** - against
+the spec's own margin criterion (buffered playback time must exceed
+worst-case SD latency + scheduling margin), a 32KB block representing
+~171ms of buffered audio has >30x margin over this observed latency, with
+zero stalls/outliers in 80 total reads. Note: this works out to only
+~6.7 MB/s, well under the ~24 MB/s a 4-bit/48MHz bus could theoretically
+support - most likely this HAL version's CPU-polling (non-DMA) read path
+noted elsewhere in `sd_diag.c`, not a card/bus limit; worth re-measuring
+with `BSP_SD_ReadBlocks_DMA` if throughput itself becomes a concern
+(latency/margin conclusions above aren't affected either way).
+
+### DMA-mode reads: a real ~3x speedup, and a real STM32H7 gotcha along the way (2026-09-28)
+
+Asked "can we squeeze more speed out of this card" - the CPU-polling
+latency benchmark above (`SD_Diag_LatencyTest()`, ~4.7-4.9ms/32KB) only
+reached ~6.7-7.0 MB/s, well under the ~24 MB/s a 4-bit/48MHz bus should
+support. Built `SD_Diag_LatencyTestDma()` (same benchmark, via
+`BSP_SD_ReadBlocks_DMA()` instead of the CPU-polling `HAL_SD_ReadBlocks()`)
+to check whether that gap was the polling implementation or something
+further upstream.
+
+First attempt required actually enabling the SDMMC1 NVIC interrupt and
+adding `SDMMC1_IRQHandler()` (`stm32h7xx_it.c`) calling
+`HAL_SD_IRQHandler(&hsd1)` - never wired up in this project since every
+prior test used polling, which doesn't need it. Confirmed via GDB
+(`gDmaFirstAttemptDiag`): before this, every DMA call left
+`hsd1.State` stuck at `HAL_SD_STATE_BUSY` forever (no completion
+interrupt ever fired).
+
+After wiring up the interrupt, the benchmark completed suspiciously
+fast (~90-280us/32KB, implying ~364 MB/s - physically impossible for
+this bus) and, when checked against known-good content
+(`gLba8192Dump`), the "successfully" read data **didn't match** - the
+transfer wasn't actually completing correctly. `hsd1.ErrorCode` after
+each "success" was `0x20` (`HAL_SD_ERROR_RX_OVERRUN`) on **100% of
+attempts (0/80 clean)** - the test's own logic was only checking for a
+timeout, not `ErrorCode`, so it was recording fast, garbage "successes."
+
+**Root cause: the target buffer was allocated in DTCM (the linker
+script's default RAM region for all static/global data on this H7
+target), which is not reachable by SDMMC1's IDMA (or any system DMA
+master) on STM32H7** - DTCM is exclusively a CPU-tightly-coupled port,
+not on the AXI/AHB bus matrix. This is a well-known STM32H7 gotcha, and
+exactly the risk `project-specifications.md`'s "Cache / DMA Coherency"
+and "Proposed Memory Sections" already flag ("DMA/peripheral
+accessibility differs per region... SDMMC buffers... DMA-accessible
+SRAM") - not a new instance of this investigation's SD signal-integrity
+issue, and not card/bus-related at all. Fixed by adding a `.dma_buffer`
+linker section (`STM32H723xx_FLASH.ld`) mapped into this board's AXI
+SRAM (`RAM`, 0x24000000, 320KB - declared in the linker script but
+completely unused by this project until now) and tagging the buffer
+`__attribute__((section(".dma_buffer")))`.
+
+**After the fix: 20/20 clean in every region, zero errors, and real,
+trustworthy numbers:**
+
+| Mode | LBA 8192 avg | Other regions avg | Effective throughput |
+|---|---|---|---|
+| CPU-polling (`HAL_SD_ReadBlocks`) | 4904 us | ~4713-4714 us | ~6.7-7.0 MB/s |
+| DMA (`BSP_SD_ReadBlocks_DMA`) | 1690 us | ~1499-1500 us | ~19.4-21.9 MB/s |
+
+**DMA is ~2.9-3.1x faster and reaches ~91% of the 4-bit/48MHz bus's
+~24 MB/s theoretical ceiling**, versus CPU-polling's ~28-29%. Confirms
+the earlier gap was the polling implementation, not a card or bus
+limit. Design implication: the real product's real-time SD-refill path
+should use DMA-mode reads (consistent with `project-specifications.md`'s
+existing "ADC + DMA only, CPU must not poll" principle extended to SD),
+and any DMA target buffer must go in DMA-accessible RAM (AXI/AHB SRAM),
+never DTCM - now a concretely verified constraint on real hardware, not
+just a documented caution.
+
+### SYSCLK raised 192MHz -> 550MHz (H723's max): confirms which path is CPU-bound (2026-09-28)
+
+Raised `SystemClock_Config()` (`main.c`) from this project's original
+default (HSI/PLLM4/PLLN12, VOS2, SYSCLK=192MHz) to the H723's rated
+maximum: PLLN 12->34 with fractional PLLFRACN=3072 (VCO=16MHz*(34+3072/8192)
+=550MHz exactly), PWR VOS2->VOS0, FLASH_LATENCY_1->4 (conservative - above
+the ~WS3 the published VOS0 breakpoint table implies for 275MHz AXI clock,
+kept as safety margin pending a direct RM0468 check). AHB/APB dividers
+unchanged (already DIV2 throughout, which lands exactly on H723's own
+ceilings at 550MHz: HCLK/AXI=275MHz, APB1-4=137.5MHz - no other changes
+needed). Deliberately raised PLLQ 4->11 alongside PLLN so the SDMMC1
+kernel clock (`RCC_SDMMCCLKSOURCE_PLL`) stays a clean, fixed 50MHz
+(550/11) instead of drifting with the SYSCLK change - keeps this a
+single-variable comparison (CPU clock only), not confounded by an
+incidental SD bus-clock change (was 48MHz at the old 192MHz VCO/PLLQ=4;
+50MHz is still exactly ADR-008's stated ceiling). Confirmed via GDB:
+`SystemCoreClock=550000000`, no hang/Error_Handler, 20/20 clean on the
+DMA benchmark same as before.
+
+**Result - this answers which path is actually CPU-bound:**
+
+| Mode | 192MHz avg | 550MHz avg | Speedup | Effective throughput at 550MHz |
+|---|---|---|---|---|
+| CPU-polling | ~4713-4904 us | ~2158-2354 us | **~2.1-2.2x** | ~15.2 MB/s (was ~6.7-7.0) |
+| DMA | ~1499-1690 us | ~1434-1854 us | ~1.04-1.05x (region 1 noisier this run) | ~22.9 MB/s (was ~21.9) |
+
+CPU-polling improved dramatically and roughly tracks the ~2.86x clock
+increase (sublinearly, as expected - it's not purely CPU-bound, there's
+still real bus/card time in the loop) - confirming this path's throughput
+ceiling really is substantially gated by how fast the CPU can drain the
+SDMMC FIFO, not the card or bus. DMA improved only marginally (~4-5% on
+the more stable regions), confirming DMA-mode reads are already bus/card-
+limited, not CPU-limited - consistent with reaching ~91-95% of the
+4-bit/48-50MHz bus's ~24 MB/s theoretical ceiling already at 192MHz.
+**Net: DMA-mode reads are the right choice regardless of CPU clock - a
+faster core doesn't close much of the remaining gap to bus-rate, while it
+transforms the CPU-polling path.** For a design that also needs CPU
+headroom for real-time mixing/ADC/UI work (this project's actual
+end goal), DMA is doubly preferable: faster **and** frees the CPU during
+the transfer, which raising SYSCLK alone doesn't do for the polling path.
+
+### Is a direct-from-SD trigger path viable? Size sweep + dual-trigger contention (2026-09-29)
+
+Asked a different question than the streaming-refill latency above: what
+if the attack cache is dropped entirely and playback reads straight from
+SD at trigger time? That puts SD latency directly against
+`project-specifications.md`'s 5ms ceiling / 2-3ms engineering target,
+where a 32KB read's ~1.4-1.7ms already eats most of the budget - but
+32KB (170ms of audio) is far more than a single kick hit's *attack* needs.
+Swept read size (DMA, LBA 8192, Samsung EVO card, 550MHz SYSCLK, 10 reps
+each) to find the real relationship between size and latency:
+
+| Size | Latency (avg) | Audio represented (32-bit/48kHz mono) |
+|---|---|---|
+| 512 B | 284 us | 2.7 ms |
+| 2 KB | 555 us | 10.7 ms |
+| 4 KB | 556 us | 21.3 ms |
+| **8 KB** | **876 us** | **42.7 ms** |
+| 16 KB | 1199 us | 85.3 ms |
+| 32 KB | 1850 us | 170.7 ms |
+
+Fits a **~260us fixed floor** (command/response round-trip + DMA/ISR
+setup - doesn't shrink with smaller reads) **+ ~20.6 MB/s** beyond that.
+The 1ms crossover lands around ~15KB. **8KB clears 1ms with real margin
+(~120us) and represents ~43ms of audio** - likely enough to cover a kick
+hit's attack, possibly a whole short hit, on this specific low-cost,
+non-A2, "older gen" card, on a generic dev PCB (not even a proper
+product board).
+
+**The one real risk this doesn't address: SDMMC1 is a single shared
+peripheral.** Two near-simultaneous triggers (the project's two beater
+sensors) can't both read at once. Tested directly
+(`SD_Diag_ContentionTestDma()`): issue a read for "voice A," then the
+instant the peripheral frees up, issue "voice B" - measuring B's real
+trigger-to-ready time including whatever it had to queue behind A.
+
+**Result (8KB, 10/10 consistent): voice A (uncontended) ~792us; voice B
+(queued behind A) ~1523-1524us** - essentially exactly double, since B
+can't start until A finishes. This is the honest worst case for a
+direct-from-SD design when both beaters are struck at the same instant:
+not ~0.9ms, but ~1.5ms. Against the full budget (1.5ms SD + ~1-2ms ADC
+classification + ~0.1-0.7ms output scheduling ≈ 2.6-4.2ms), still under
+the 5ms hard ceiling, but it eats past the 2-3ms *engineering target*
+specifically in the simultaneous-hit case - not disqualifying, but a
+real, quantified cost of dropping the attack cache, not a free win.
+
+**Net effect on the external-RAM proposal (`h723-sdram-sampler-
+proposal.md`):** if ~43ms of buffered attack time per voice is enough
+for this instrument's actual sample library (a decision still pending -
+depends on real kick-hit sample lengths, not yet measured), a
+direct-from-SD design needs no attack cache and no external RAM at all -
+just small per-voice DMA target buffers (a few×8KB, trivially fits in
+even the H723's internal 432KB, let alone via nothing external). That
+also reopens `decisions.md` ADR-001's 64-pin `STM32H7A3RIT6` production
+candidate, since it was only tight on pins because of the FMC SDRAM
+option, not the baseline peripheral set. Still open: whether ~1.5ms
+worst-case for the second-triggered voice is actually acceptable, and
+what the real kick-hit sample lengths are - both need a decision, not an
+assumption, before this supersedes the RAM proposal or the original
+streaming design.
+
+### Low-cost vs. premium card: SanDisk Extreme A2 vs. Samsung EVO (2026-09-29)
+
+Swapped in a SanDisk Extreme A2 card (confirmed genuinely SanDisk via live
+CID: `ManufacturerID=0x03`, `OEM="SD"` — matches SanDisk's real assigned ID,
+unlike either card tested earlier in this investigation) and re-ran the full
+test suite unchanged (same firmware, same board, 550MHz SYSCLK) for a direct
+comparison against the Samsung EVO numbers above.
+
+32KB fixed-size DMA reads: roughly a wash (SanDisk ~20-21 MB/s vs. Samsung's
+~18-23 MB/s depending on region) - no meaningful difference at this size.
+
+**The size sweep tells a more interesting story:**
+
+| Size | SanDisk (min/max/avg) | Samsung EVO (min/max/avg) |
+|---|---|---|
+| 512B | 200/225/222us | 269/424/284us |
+| 2KB | 432/501/439us | -/-/555us |
+| 4KB | 496/585/505us | -/-/556us |
+| **8KB** | **633/1509/1411us** | 792/887/876us |
+| 16KB | 1086/1363/1334us | 1130/1211/1199us |
+| 32KB | 1646/1768/1659us | 1806/1860/1850us |
+
+SanDisk is faster almost everywhere except **8KB - the exact size the
+direct-from-SD-trigger-path question hinges on** - where it's dramatically
+worse and far more variable (633-1509us, ~2.4x spread) than Samsung's tight
+792-887us. Confirmed by the contention test at 8KB: SanDisk's queued
+second-voice latency is **~2205us vs. Samsung's ~1523us** - ~45% worse.
+Most likely explanation: a more sophisticated on-card controller doing
+occasional internal housekeeping (GC/wear-leveling) that a simpler, cheaper
+controller doesn't do as aggressively - a known, if counterintuitive,
+pattern where a "better-rated" card can have worse *worst-case* latency
+despite winning on throughput and other sizes.
+
+**Implication: paying more for a rated-faster (A2) card does not
+automatically buy better worst-case latency for this specific workload**
+(small ~8KB reads at trigger time) - for a real-time budget, worst-case and
+consistency matter more than average throughput or a marketing rating. On
+this one-sample comparison, the cheap Samsung EVO is the safer choice for a
+direct-from-SD trigger design. Caveat: n=1 per card, one test run each -
+this is a real, actionable data point, not yet a proven rule; worth
+repeating on additional units/brands before treating "cheap cards have
+tighter worst-case latency" as a general finding rather than this specific
+comparison.
+
+**Third data point, same day: a PNY Elite card** - its CID
+(`ManufacturerID=0x27`, `OEM="PH"`, `ProdName="SD32G"`, `SN=0x7396FA05`)
+exactly matches this investigation's original "primary" test card from the
+very start of the whole investigation, confirming it's the same physical
+unit tested throughout months of prior work, not a distinct part; `0x27`/"PH"
+is a Phison-controller signature, the same rebadged-generic category as the
+Samsung/SanDisk comparison above - run through the identical suite for a
+three-way comparison:
+
+| Size | Samsung EVO | SanDisk Extreme A2 | PNY Elite |
+|---|---|---|---|
+| 512B | 284us | 222us | 222us |
+| 2KB | 555us | 439us | 264us |
+| 4KB | 556us | 505us | 349us |
+| **8KB** | 876us | 1411us (wild) | **518us** |
+| 16KB | 1199us | 1334us | 856us |
+| 32KB | 1850us | 1659us | 1626us |
+
+| Contention (8KB) | Voice A | Voice B (queued) |
+|---|---|---|
+| Samsung EVO | ~792us | ~1523us |
+| SanDisk Extreme A2 | ~747us | ~2205us |
+| PNY Elite | ~630us | **~1190us** |
+
+**This card wins outright** - fastest or tied-fastest at every size, and by
+a wide margin at 8KB and in the contention worst-case (best of all three).
+Now two of three cards (both cheap, "ordinary" ones) clearly beat the
+premium-rated SanDisk at exactly the workload size this design depends on -
+a consistent pattern across two comparisons now, not a single anomaly.
+Strengthens the earlier caveat into a real, if still small-sample (n=3),
+trend: **for this access pattern, a marketing speed rating doesn't predict
+worst-case small-read latency, and the cheapest option tested so far is
+also the best-performing one.**
+
+**Fourth card, same day: Patriot LX** (CID: `ManufacturerID=0x12`,
+`OEM=0x3456`, `ProdName="ASTC."`, `SN=19` - a distinct physical unit).
+Fastest yet at every size:
+
+| Size | Samsung EVO | SanDisk Extreme A2 | PNY Elite | Patriot LX |
+|---|---|---|---|---|
+| 512B | 284 | 222 | 222 | 202 |
+| 2KB | 555 | 439 | 264 | 239 |
+| 4KB | 556 | 505 | 349 | 324 |
+| 8KB | 876 | 1411 | 518 | 493 |
+| 16KB | 1199 | 1334 | 856 | 832 |
+| 32KB | 1850 | 1659 | 1626 | 1599 |
+
+| Contention (8KB) | Voice A | Voice B (queued) |
+|---|---|---|
+| Samsung EVO | 792 | 1523 |
+| SanDisk Extreme A2 | 747 | 2205 |
+| PNY Elite | 630 | 1190 |
+| Patriot LX | 599 | 1120 |
+
+n=4 now: the two cheapest cards (PNY Elite, Patriot LX) are the two fastest
+at every size and have the best contention worst-case, while the one
+premium/A2-rated card (SanDisk) is the worst at the size that matters most.
+Trend holding, not just one anomaly.
+
 ## Recommended next step
 
-Every host-side/software/config lever we could find has been tried
-(width, speed, edge, flow control, pin, data-movement mechanism, address,
-RX sampling phase, and now ST's own suggested init-sequencing fix), and
-the actual bus signals have been captured and show real, physical
-bit-level corruption concentrated in part of the transfer. We believe the
-next productive step is on the electrical side: checking for
-simultaneous-switching noise/crosstalk between the four data lines during
-a real 4-bit transfer (e.g. an oscilloscope capture of the analog
-waveforms, not just digital logic levels, focused on the corrupted region
-of the transfer), and/or advice from ST on whether this board's
-trace-length mismatch on D0 (PB13 vs. the matched CN8 group) is expected
-to cause this class of failure in 4-bit mode specifically.
+Every host-side/software/config lever found has been tried and ruled
+out (width, speed, edge, flow control, pin, data-movement mechanism,
+address, RX sampling phase, GPIO drive strength, three rounds of
+init-sequencing fixes including ST's own suggested fix) — see the
+sections above for detail. Two independent cross-chip control tests
+(our own repro and Zephyr RTOS, both on NUCLEO-H723ZG) reproduce the
+identical failure, and Round 4's known-good-harness result (above) is
+the cleanest isolation yet: identical wires/card/pins pass cleanly on
+SDIO(v1) up to 12MHz and on this exact SDMMC-v2 peripheral's own 1-bit
+path at every speed including 48MHz, but fail 100% of the time in
+4-bit at every speed including 400kHz. "Jumper wires are just marginal"
+is ruled out for the H7 side by this evidence.
+
+**Driver vs. silicon — updated per Round 5.** The content dose-response
+result reframes this: it is not a general 4-bit datapath defect (every
+non-4-line-transition pattern is 100% clean at every rep), and the
+strongest evidence for a peripheral-internal *sequencing* hazard (the
+CMD-line bit flip) turned out to be a decode artifact, not real
+corruption. The live candidates now:
+1. **A card-side simultaneous-switching/crosstalk effect** (an extra
+   perceived clock edge at the card when enough of its own output drivers
+   switch together, within whichever pins are physically clustered on a
+   given board). Supported directly by the dose-response experiment
+   (exact predict-and-confirm match) and by the card's own transmitted
+   CRC16 matching the correct ground truth (the card had the right data,
+   it simply over-counted clock edges — not explainable as a receive-side
+   digital logic defect). Not driver-fixable in the usual sense, though
+   `GPIO_SPEED_FREQ_MEDIUM` (already tried, no effect) and further
+   slew-rate/termination changes remain untested board-level levers.
+2. **A less likely but not fully excluded receive-side timing
+   contribution** — the RX delay-block sweep (1536 points, 0 clean) and
+   `ClockEdge` polarity are already ruled out; not yet checked is a
+   register-level diff of what `HAL_SD_Init()`/`HAL_SD_ConfigWideBusOperation()`
+   touch differently in 1-bit vs 4-bit beyond `WIDBUS`. Weakened
+   substantially by branch 1's clean predict-and-confirm result.
+
+**Status, updated per Round 6:** the content dose-response result (Round
+5), now confirmed clean across the *entire* speed range this peripheral
+supports on a real PCB (Round 6 — 36/36 combinations clean, including
+max-density transitions at full 48MHz), is the strongest, most decisive
+evidence in this investigation — a designed experiment with exact
+predicted outcomes, replicated on a second physical board with the
+opposite result from the first. It also means the CMD-line finding
+should **not** be reported to ST as evidence (it's an artifact). The
+"driver vs. silicon" framing itself is now the wrong frame — this reads
+as a **board-layout/decoupling-quality issue specific to bare-wire
+breakout adapters**, not a peripheral, chip-family, or driver defect;
+the F401 cross-chip harness result (Round 4) should be re-read in that
+light too (its own 16MHz ceiling is most likely the same class of
+effect, just with more margin on that harness/chip combination, not
+evidence of an H7-specific problem). Next: repeat the dose-response
+sweep on the F401 above its 16MHz wall to check whether its failures
+also cluster on 4-line transitions specifically; a physical A/B
+(decoupling at the card, series resistor on CLK, dedicated ground
+return) on the *original* bare-wire adapter, using the `0F/0F` pattern's
+mismatch count as a quantitative margin metric, to identify which
+specific layout factor closes the gap; and, if useful, building a
+from-scratch bare-wire adapter with deliberately better layout
+(decoupling cap at the card, twisted/short ground return) to see how
+close it can get to this board's cleanliness.
 
 ## Diagnostics reference
 
